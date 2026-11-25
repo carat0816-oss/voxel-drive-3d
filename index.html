@@ -447,13 +447,10 @@ function 更新(dt) {
     状態.nextCP = (状態.nextCP + 1) % CP.length;
   }
 
-  // 見た目：車体の傾き
-  const 加速 = 走 && 入力.gas ? 1 : 走 && 入力.brake ? -1 : 0;
+  // 見た目：曲がるときの左右の傾きだけ（加減速の前後の沈み・草地の揺れは一旦なし）
   車.roll += (-車.舵 * Math.min(1, Math.abs(車.v) / 最高速) * 0.09 - 車.roll) * Math.min(1, dt * 8);
-  車.pitch += (-加速 * 0.04 - 車.pitch) * Math.min(1, dt * 6);
-  const 揺 = 路上 ? 0 : Math.sin(performance.now() / 35) * Math.min(1, Math.abs(車.v) / 60) * 0.5;
-  車mesh.position.set(車.x, 揺, 車.z);
-  車mesh.rotation.set(車.pitch, -車.a, 車.roll);
+  車mesh.position.set(車.x, 0, 車.z);
+  車mesh.rotation.set(0, -車.a, 車.roll);
 
   if (msgTimer > 0 && (msgTimer -= dt) <= 0) document.getElementById('msg').style.opacity = 0;
 }
