@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Voxel Drive 3D</title>
+<style>
+  :root { --text:#fff; --shadow:0 2px 0 #0008; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#8ec5ff; font-family: system-ui, "Yu Gothic UI", sans-serif; color:var(--text); touch-action:none; user-select:none; -webkit-user-select:none; }
+  canvas { display:block; }
+  #hud { position:fixed; left:12px; top:10px; font-size:15px; line-height:1.5; text-shadow:var(--shadow); font-variant-numeric:tabular-nums; pointer-events:none; }
+  #hud b { font-size:26px; }
+  #speed { position:fixed; right:14px; top:10px; font-size:26px; font-weight:700; text-shadow:var(--shadow); font-variant-numeric:tabular-nums; pointer-events:none; }
+  #center { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; font-size:72px; font-weight:800; text-shadow:0 4px 0 #0006; pointer-events:none; }
+  #msg { position:fixed; left:0; right:0; top:28%; text-align:center; font-size:28px; font-weight:700; text-shadow:var(--shadow); pointer-events:none; opacity:0; transition:opacity .3s; }
+  #help { position:fixed; left:12px; bottom:10px; font-size:12px; opacity:.85; text-shadow:var(--shadow); pointer-events:none; }
+  .touch { display:none; }
+  @media (pointer:coarse) {
+    .touch { display:flex; position:fixed; bottom:18px; gap:14px; }
+    #help { display:none; }
+  }
+  .touch.l { left:16px; } .touch.r { right:16px; }
+  .touch button { width:76px; height:76px; border-radius:50%; border:2px solid #fff8; background:#0004; color:#fff; font-size:26px; font-weight:700; touch-action:none; }
+  .touch button.on { background:#fff5; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./three.module.min.js" } }
+</script>
+</head>
+<body>
+<div id="hud"></div>
+<div id="speed"></div>
+<div id="center"></div>
+<div id="msg"></div>
+<div id="help">W/↑ アクセル　S/↓ ブレーキ・後退　A D/← → ハンドル　R リスタート</div>
+<div class="touch l"><button data-k="left">◀</button><button data-k="right">▶</button></div>
+<div class="touch r"><button data-k="brake">▼</button><button data-k="gas">▲</button></div>
+
+<script type="module">
+import * as THREE from 'three';
+
+// =====================================================================
+// 決定的な乱数・ハッシュ（同じコードなら毎回まったく同じ世界になる）
+// =====================================================================
+function ハッシュ(x, y, z, seed) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 1274126177) + Math.imul(seed, 2246822519)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function 乱数列(seed) { // mulberry32
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// =====================================================================
+// ボクセル定義 → 3Dメッシュ
+//   fn(x, y, z) が色(#rrggbb)か null。x=幅, y=奥行き(0が前), z=高さ
+//   外から見える面だけを1枚のジオメトリにまとめる
+// =====================================================================
+const 面一覧 = [
+  { d: [ 1, 0, 0], c: [[1,0,0],[1,1,0],[1,1,1],[1,0,1]] },
+  { d: [-1, 0, 0], c: [[0,0,0],[0,1,0],[0,1,1],[0,0,1]] },
+  { d: [ 0, 1, 0], c: [[0,1,0],[1,1,0],[1,1,1],[0,1,1]] },
+  { d: [ 0,-1, 0], c: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]] },
+  { d: [ 0, 0, 1], c: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
+  { d: [ 0, 0,-1], c: [[0,0,0],[1,0,0],[1,1,0],[0,1,0]] },
+];
+const 色表 = {};
+const 線形色 = c => 色表[c] || (色表[c] = new THREE.Color(c));
+
+function ボクセルモデル(W, D, H, fn) {
+  const grid = new Array(W * D * H);
+  const idx = (x, y, z) => (z * D + y) * W + x;
+  for (let z = 0; z < H; z++) for (let y = 0; y < D; y++) for (let x = 0; x < W; x++) grid[idx(x,y,z)] = fn(x, y, z) || null;
+  const 有 = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < W && y < D && z < H && grid[idx(x,y,z)] !== null;
+
+  const pos = [], nor = [], col = [], ind = [];
+  const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3(), n = new THREE.Vector3();
+  for (let z = 0; z < H; z++) for (let y = 0; y < D; y++) for (let x = 0; x < W; x++) {
+    const c = grid[idx(x,y,z)]; if (!c) continue;
+    const base = 線形色(c);
+    const ao = 0.82 + 0.18 * (H > 1 ? z / (H - 1) : 1);   // 低い所ほど少し暗く
+    for (const f of 面一覧) {
+      // 3D 座標系：X=x, Y=z(高さ), Z=y  → 方向も同じ対応で隣を確認
+      const [dX, dY, dZ] = f.d;
+      if (有(x + dX, y + dZ, z + dY)) continue;
+      const b = pos.length / 3;
+      const pts = f.c.map(([cx, cy, cz]) => [x + cx - W / 2, z + cy, y + cz - D / 2]);
+      // 巻き方向を法線に合わせる
+      v0.fromArray(pts[0]); v1.fromArray(pts[1]); v2.fromArray(pts[2]);
+      n.subVectors(v1, v0).cross(v2.clone().sub(v0));
+      const 逆 = n.x * dX + n.y * dY + n.z * dZ < 0;
+      const j = ハッシュ(x, y, z, 3) * 0.06 - 0.03;          // ほんの少し色ムラ
+      for (const p of pts) {
+        pos.push(...p); nor.push(dX, dY, dZ);
+        col.push(base.r * (ao + j), base.g * (ao + j), base.b * (ao + j));
+      }
+      if (逆) ind.push(b, b + 2, b + 1, b, b + 3, b + 2);
+      else ind.push(b, b + 1, b + 2, b, b + 2, b + 3);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(ind);
+  g.computeBoundingSphere();
+  return g;
+}
+
+// ---------------- モデル（すべてコード定義） ----------------
+const 車G = ボクセルモデル(14, 24, 9, (x, y, z) => {
+  const 車輪Y = (y >= 3 && y <= 7) || (y >= 16 && y <= 20);
+  if (z >= 6) {
+    if (z === 6 && y === 7 && x >= 3 && x <= 10) return '#4a6a8c';
+    if (x < 2 || x > 11 || y < 8 || y > 17) return null;
+    if (z === 8) return (x >= 6 && x <= 7) ? '#f2f2f2' : (x >= 3 && x <= 10 && y >= 9 && y <= 16 ? '#d8443a' : null);
+    if (x === 2 || x === 11 || y === 8 || y === 17) return '#4a6a8c';
+    return '#d8443a';
+  }
+  if ((x === 0 || x === 13) && 車輪Y && z <= 3) return (z === 1 || z === 2) && (y === 5 || y === 18) ? '#b8b8c0' : '#222228';
+  if (z <= 1) return (車輪Y && x >= 1 && x <= 12) ? '#222228' : null;
+  if (x < 1 || x > 12 || y < 1 || y > 22) return null;
+  if ((x === 1 || x === 12) && (y === 1 || y === 22)) return null;
+  if (y === 1 && (z === 3 || z === 4) && [2,3,10,11].includes(x)) return '#ffe9a0';
+  if (y === 22 && (z === 3 || z === 4) && [2,3,10,11].includes(x)) return '#ff3030';
+  if (z === 2) return '#8a2a26';
+  if (z === 5 && x >= 6 && x <= 7) return '#f2f2f2';
+  return '#d8443a';
+});
+
+const 木箱G = ボクセルモデル(10, 10, 10, (x, y, z) => {
+  const 端 = (x === 0 || x === 9) + (y === 0 || y === 9) + (z === 0 || z === 9);
+  if (端 >= 2) return '#7a4a22';
+  if (z === 9) return (x % 3 === 0) ? '#a87038' : '#c08a4a';
+  return (z % 3 === 0) ? '#a87038' : '#c08a4a';
+});
+
+const 樽G = ボクセルモデル(10, 10, 11, (x, y, z) => {
+  const d = Math.hypot(x - 4.5, y - 4.5);
+  if (d > 4.2 + 0.5 * Math.sin(Math.PI * z / 10)) return null;
+  if (z === 10) return d < 3 ? '#2e5a88' : '#3a6ea5';
+  if (z === 2 || z === 8) return '#2a3a4a';
+  return '#3a6ea5';
+});
+
+const コーンG = ボクセルモデル(9, 9, 10, (x, y, z) => {
+  if (z === 0) return '#c04a18';
+  if (Math.hypot(x - 4, y - 4) > 3.8 * (1 - (z - 1) / 10) + 0.3) return null;
+  return (z === 4 || z === 5) ? '#f4f4f4' : '#ff7a28';
+});
+
+function 木G(seed) {
+  const rnd = 乱数列(seed);
+  const 球 = [[8, 8, 15, 6.5]];
+  for (let i = 0; i < 3; i++) 球.push([8 + rnd() * 6 - 3, 8 + rnd() * 6 - 3, 11 + rnd() * 8, 3.5 + rnd() * 2]);
+  return ボクセルモデル(17, 17, 23, (x, y, z) => {
+    for (const [cx, cy, cz, r] of 球) {
+      if (Math.hypot(x - cx, y - cy, (z - cz) * 1.1) <= r - ハッシュ(x, y, z, seed) * 1.4) {
+        const n = ハッシュ(x, y, z, seed + 7);
+        return n < 0.33 ? '#2f6e30' : n < 0.75 ? '#3f8a3a' : '#4fa24a';
+      }
+    }
+    if (x >= 7 && x <= 9 && y >= 7 && y <= 9 && z <= 12 && !(x !== 8 && y !== 8)) return '#6b4426';
+    return null;
+  });
+}
+const 木Gs = [木G(11), 木G(23), 木G(37)];
+
+const 家G = ボクセルモデル(26, 22, 22, (x, y, z) => {
+  if (x >= 18 && x <= 20 && y >= 4 && y <= 6 && z >= 12) return z === 21 ? '#5a2a20' : '#8a3a2a';
+  if (z >= 12) {
+    const half = 11 - (z - 12) * (10.5 / 9);
+    const dy = Math.abs(y - 10.5);
+    if (dy > half) return null;
+    const 屋根 = dy > half - 1.5;
+    if (x === 0 || x === 25) return 屋根 ? '#9a3e30' : null;
+    return 屋根 ? (z % 2 ? '#b04a3a' : '#9a3e30') : '#e8dcc0';
+  }
+  if (x < 1 || x > 24 || y < 1 || y > 20) return null;
+  if (z === 0) return '#9a948a';
+  const 正面 = y === 20, 背面 = y === 1, 側面 = x === 1 || x === 24;
+  if (正面 && x >= 11 && x <= 14 && z <= 7) return z === 7 || x === 11 || x === 14 ? '#4a2e18' : '#6b4426';
+  const 窓枠 = (a, b, lo, hi) => a >= lo && a <= hi && b >= 5 && b <= 8;
+  if ((正面 || 背面) && (窓枠(x, z, 4, 7) || 窓枠(x, z, 18, 21))) return (x === 4 || x === 7 || x === 18 || x === 21 || z === 5 || z === 8) ? '#f4f0e6' : '#5a7aa0';
+  if (側面 && 窓枠(y, z, 8, 13)) return (y === 8 || y === 13 || z === 5 || z === 8) ? '#f4f0e6' : '#5a7aa0';
+  return '#e8dcc0';
+});
+
+// スタート／ゴールのゲート（道路幅にまたがる）
+const ゲートG = ボクセルモデル(44, 3, 30, (x, y, z) => {
+  const 柱 = x <= 2 || x >= 41;
+  if (柱 && z < 30) return z % 6 < 3 ? '#e8e8e8' : '#d03030';
+  if (z >= 22 && z <= 28) return ((x >> 1) + (z >> 1)) % 2 ? '#111111' : '#f4f4f4';
+  return null;
+});
+
+// =====================================================================
+// 世界のレイアウト（固定）
+// =====================================================================
+const 世界 = 640, 中心 = 320, 道R = 198, 道半幅 = 18, 池 = [110, 110, 40];
+
+const 地面canvas = document.createElement('canvas'); 地面canvas.width = 世界; 地面canvas.height = 世界;
+(() => {
+  const g = 地面canvas.getContext('2d'); const im = g.createImageData(世界, 世界);
+  const hx = c => [parseInt(c.slice(1,3),16), parseInt(c.slice(3,5),16), parseInt(c.slice(5,7),16)];
+  const 草 = ['#4a8a3a', '#4f9440', '#468236'].map(hx);
+  for (let y = 0; y < 世界; y++) for (let x = 0; x < 世界; x++) {
+    let c;
+    const r = Math.hypot(x - 中心, y - 中心), dr = Math.abs(r - 道R);
+    const pd = Math.hypot(x - 池[0], y - 池[1]);
+    const n = ハッシュ(x, y, 0, 99);
+    if (pd < 池[2]) c = hx(n < 0.04 ? '#5a90d0' : '#3a70b0');
+    else if (pd < 池[2] + 4) c = hx(n < 0.3 ? '#b8a060' : '#c8b070');
+    else if (dr <= 道半幅) {
+      if (dr > 道半幅 - 1.5) c = hx('#d8d8d0');
+      else if (dr < 1 && Math.floor(Math.atan2(y - 中心, x - 中心) * 道R / 8) % 2 === 0) c = hx('#e8c040');
+      else c = hx(n < 0.1 ? '#5a5a64' : '#50505a');
+    } else {
+      c = 草[Math.floor(ハッシュ(x >> 1, y >> 1, 1, 5) * 3)];
+      if (n > 0.996) c = hx(n > 0.998 ? '#e8d860' : '#f0f0f0');
+    }
+    const p = (y * 世界 + x) * 4;
+    im.data[p] = c[0]; im.data[p+1] = c[1]; im.data[p+2] = c[2]; im.data[p+3] = 255;
+  }
+  g.putImageData(im, 0, 0);
+  // スタートラインの市松
+  for (let i = 0; i < 道半幅 * 2; i += 2) for (let j = 0; j < 4; j += 2) {
+    g.fillStyle = ((i + j) / 2) % 2 ? '#111' : '#f4f4f4';
+    g.fillRect(中心 + 道R - 道半幅 + i, 中心 - 2 + j, 2, 2);
+  }
+})();
+
+// =====================================================================
+// three.js の準備
+// =====================================================================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#8ec5ff');
+scene.fog = new THREE.Fog('#8ec5ff', 220, 620);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 2000);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+scene.add(new THREE.HemisphereLight('#cfe6ff', '#4a6a3a', 1.6));
+const sun = new THREE.DirectionalLight('#fff4e0', 2.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -140, right: 140, top: 140, bottom: -140, near: 1, far: 500 });
+sun.shadow.bias = -0.0008;
+scene.add(sun, sun.target);
+
+const 地面tex = new THREE.CanvasTexture(地面canvas);
+地面tex.magFilter = THREE.NearestFilter;
+地面tex.colorSpace = THREE.SRGBColorSpace;
+地面tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+const 地面 = new THREE.Mesh(new THREE.PlaneGeometry(世界, 世界), new THREE.MeshLambertMaterial({ map: 地面tex }));
+地面.rotation.x = -Math.PI / 2; 地面.position.set(中心, 0, 中心); 地面.receiveShadow = true;
+scene.add(地面);
+const 外側 = new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000), new THREE.MeshLambertMaterial({ color: '#3f7a32' }));
+外側.rotation.x = -Math.PI / 2; 外側.position.set(中心, -0.2, 中心);
+scene.add(外側);
+
+const 材質 = new THREE.MeshLambertMaterial({ vertexColors: true });
+function 置く(geo, x, z, a, s = 1) {
+  const m = new THREE.Mesh(geo, 材質);
+  m.position.set(x, 0, z); m.rotation.y = -a; m.scale.setScalar(s);
+  m.castShadow = true; m.receiveShadow = true;
+  scene.add(m); return m;
+}
+
+// 障害物（当たり判定は円）
+const 障害 = [];
+const 静的 = (geo, x, z, a, s, r) => { 置く(geo, x, z, a, s); 障害.push({ x, z, r }); };
+静的(家G, 290, 300, 0, 1.6, 20);
+静的(家G, 372, 352, 0.45, 1.6, 20);
+[[322, 252], [336, 256], [328, 240]].forEach(([x, z], i) => 静的(木箱G, x, z, i * 0.3, 1.2, 6.5));
+[[250, 340], [261, 347], [244, 354]].forEach(([x, z], i) => 静的(樽G, x, z, i, 1.2, 5.5));
+置く(ゲートG, 中心 + 道R, 中心, 0, 1);
+障害.push({ x: 中心 + 道R - 21, z: 中心, r: 2.5 }, { x: 中心 + 道R + 21, z: 中心, r: 2.5 });
+(() => {
+  const rnd = 乱数列(12345); const 置いた = [];
+  for (let i = 0; i < 600 && 置いた.length < 90; i++) {
+    const x = 15 + rnd() * (世界 - 30), z = 15 + rnd() * (世界 - 30), k = Math.floor(rnd() * 3), a = rnd() * 6.28, s = 1.3 + rnd() * 0.5;
+    if (Math.abs(Math.hypot(x - 中心, z - 中心) - 道R) < 38) continue;
+    if (Math.hypot(x - 池[0], z - 池[1]) < 池[2] + 14) continue;
+    if (Math.hypot(x - 330, z - 320) < 85) continue;
+    if (置いた.some(p => Math.hypot(p.x - x, p.z - z) < 18)) continue;
+    置いた.push({ x, z }); 静的(木Gs[k], x, z, a, s, 3.5 * s);
+  }
+})();
+
+// コーン（ぶつかると飛ぶ）
+const コーン = [];
+for (let i = 0; i < 24; i++) {
+  const t = i / 24 * Math.PI * 2, rr = 道R + (i % 2 ? 道半幅 + 5 : -道半幅 - 5);
+  const x = 中心 + Math.cos(t) * rr, z = 中心 + Math.sin(t) * rr;
+  const m = 置く(コーンG, x, z, t, 1.1);
+  コーン.push({ m, x, z, h: 0, vx: 0, vz: 0, vh: 0, 飛: false, 倒: false, spin: 0, 初: [x, z] });
+}
+
+// 車
+const 車mesh = 置く(車G, 0, 0, 0, 1.2);
+車mesh.rotation.order = 'YXZ';
+const スタート = { x: 中心 + 道R, z: 中心 + 30, a: 0 };
+const 車 = { x: 0, z: 0, a: 0, v: 0, 舵: 0, roll: 0, pitch: 0 };
+
+// 次のチェックポイントを示す光の柱
+const CP = [[中心 + 道R, 中心], [中心, 中心 - 道R], [中心 - 道R, 中心], [中心, 中心 + 道R]];
+const 柱 = new THREE.Mesh(new THREE.CylinderGeometry(道半幅 + 4, 道半幅 + 4, 90, 24, 1, true),
+  new THREE.MeshBasicMaterial({ color: '#ffe066', transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide }));
+scene.add(柱);
+
+// =====================================================================
+// ゲーム状態
+// =====================================================================
+const 状態 = { mode: 'count', countT: 3, lapT: 0, lap: 1, nextCP: 1, last: null, best: null, hits: 0 };
+try { const b = parseFloat(localStorage.getItem('voxelDriveBest')); if (b > 0) 状態.best = b; } catch {}
+
+function リスタート() {
+  Object.assign(車, { x: スタート.x, z: スタート.z, a: スタート.a, v: 0, 舵: 0, roll: 0, pitch: 0 });
+  Object.assign(状態, { mode: 'count', countT: 3, lapT: 0, lap: 1, nextCP: 1, last: null, hits: 0 });
+  for (const c of コーン) {
+    Object.assign(c, { x: c.初[0], z: c.初[1], h: 0, vx: 0, vz: 0, vh: 0, 飛: false, 倒: false, spin: 0 });
+    c.m.rotation.set(0, 0, 0); c.m.position.set(c.x, 0, c.z);
+  }
+}
+リスタート();
+
+const 時間表示 = t => t == null ? '--:--.--' :
+  `${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+let msgTimer = 0;
+function メッセージ(s) { const el = document.getElementById('msg'); el.textContent = s; el.style.opacity = 1; msgTimer = 2; }
+
+// =====================================================================
+// 入力（キーボード＋タッチ）
+// =====================================================================
+const 入力 = { gas: false, brake: false, left: false, right: false };
+const キー対応 = { KeyW: 'gas', ArrowUp: 'gas', KeyS: 'brake', ArrowDown: 'brake', KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right' };
+addEventListener('keydown', e => {
+  if (キー対応[e.code]) { 入力[キー対応[e.code]] = true; e.preventDefault(); }
+  if (e.code === 'KeyR') リスタート();
+});
+addEventListener('keyup', e => { if (キー対応[e.code]) 入力[キー対応[e.code]] = false; });
+addEventListener('blur', () => { for (const k in 入力) 入力[k] = false; });
+for (const b of document.querySelectorAll('.touch button')) {
+  const k = b.dataset.k;
+  const on = e => { e.preventDefault(); 入力[k] = true; b.classList.add('on'); };
+  const off = e => { e.preventDefault(); 入力[k] = false; b.classList.remove('on'); };
+  b.addEventListener('pointerdown', on); b.addEventListener('pointerup', off);
+  b.addEventListener('pointercancel', off); b.addEventListener('pointerleave', off);
+}
+
+// =====================================================================
+// 更新
+// =====================================================================
+const 最高速 = 170, 草最高速 = 75;
+function 更新(dt) {
+  if (状態.mode === 'count') {
+    状態.countT -= dt;
+    if (状態.countT <= 0) { 状態.mode = 'run'; メッセージ('GO!'); }
+  } else 状態.lapT += dt;
+
+  const 走 = 状態.mode === 'run';
+  const r = Math.hypot(車.x - 中心, 車.z - 中心);
+  const 路上 = Math.abs(r - 道R) <= 道半幅;
+  const 水 = Math.hypot(車.x - 池[0], 車.z - 池[1]) < 池[2];
+  const 上限 = 水 ? 30 : 路上 ? 最高速 : 草最高速;
+
+  if (走 && 入力.gas) 車.v += (車.v < 0 ? 260 : 120) * dt;
+  else if (走 && 入力.brake) 車.v -= (車.v > 0 ? 220 : 90) * dt;
+  else 車.v -= Math.sign(車.v) * Math.min(Math.abs(車.v), 50 * dt);
+  if (車.v > 上限) 車.v = Math.max(上限, 車.v - 200 * dt);   // 草に出たら徐々に減速
+  車.v = Math.max(-45, 車.v);
+
+  const 目標舵 = (入力.right ? 1 : 0) - (入力.left ? 1 : 0);
+  車.舵 += (目標舵 - 車.舵) * Math.min(1, dt * 10);
+  const 効き = Math.min(1, Math.abs(車.v) / 30) * Math.sign(車.v) * (1 - 0.35 * Math.min(1, Math.abs(車.v) / 最高速));
+  車.a += 2.4 * dt * 車.舵 * 効き;
+
+  車.x += Math.sin(車.a) * 車.v * dt;
+  車.z -= Math.cos(車.a) * 車.v * dt;
+  車.x = Math.max(6, Math.min(世界 - 6, 車.x));
+  車.z = Math.max(6, Math.min(世界 - 6, 車.z));
+
+  // 障害物との衝突
+  for (const o of 障害) {
+    const dx = 車.x - o.x, dz = 車.z - o.z, d = Math.hypot(dx, dz), 半径 = o.r + 8;
+    if (d < 半径 && d > 0.001) {
+      車.x = o.x + dx / d * 半径; 車.z = o.z + dz / d * 半径;
+      if (Math.abs(車.v) > 40) メッセージ('ガツン！');
+      車.v *= -0.25;
+    }
+  }
+
+  // コーン
+  for (const c of コーン) {
+    if (!c.飛 && !c.倒) {
+      const dx = c.x - 車.x, dz = c.z - 車.z, d = Math.hypot(dx, dz);
+      if (d < 11 && Math.abs(車.v) > 8) {
+        c.飛 = true; 状態.hits++;
+        const 前x = Math.sin(車.a), 前z = -Math.cos(車.a), s = Math.abs(車.v);
+        c.vx = 前x * 車.v * 1.1 + dx / d * 25; c.vz = 前z * 車.v * 1.1 + dz / d * 25;
+        c.vh = 35 + s * 0.35; c.spin = (ハッシュ(状態.hits, 1, 2, 3) - 0.5) * 18;
+        車.v *= 0.93;
+      }
+    }
+    if (c.飛) {
+      c.x += c.vx * dt; c.z += c.vz * dt; c.h += c.vh * dt; c.vh -= 220 * dt;
+      c.m.rotation.x += c.spin * dt; c.m.rotation.z += c.spin * 0.6 * dt;
+      if (c.h <= 0) {
+        c.h = 0; c.vh = -c.vh * 0.3; c.vx *= 0.55; c.vz *= 0.55;
+        if (Math.abs(c.vh) < 12) { c.飛 = false; c.倒 = true; c.m.rotation.set(Math.PI / 2, Math.atan2(c.vx, c.vz), 0, 'YXZ'); c.h = 4.4; }
+      }
+      c.m.position.set(c.x, c.h, c.z);
+    }
+  }
+
+  // チェックポイントと周回
+  const [cx, cz] = CP[状態.nextCP];
+  if (走 && Math.hypot(車.x - cx, 車.z - cz) < 道半幅 + 6) {
+    if (状態.nextCP === 0) {
+      const t = 状態.lapT;
+      状態.last = t;
+      if (状態.best == null || t < 状態.best) {
+        状態.best = t; メッセージ(`ベスト更新！ ${時間表示(t)}`);
+        try { localStorage.setItem('voxelDriveBest', String(t)); } catch {}
+      } else メッセージ(`LAP ${時間表示(t)}`);
+      状態.lap++; 状態.lapT = 0;
+    }
+    状態.nextCP = (状態.nextCP + 1) % CP.length;
+  }
+
+  // 見た目：車体の傾き
+  const 加速 = 走 && 入力.gas ? 1 : 走 && 入力.brake ? -1 : 0;
+  車.roll += (-車.舵 * Math.min(1, Math.abs(車.v) / 最高速) * 0.09 - 車.roll) * Math.min(1, dt * 8);
+  車.pitch += (-加速 * 0.04 - 車.pitch) * Math.min(1, dt * 6);
+  const 揺 = 路上 ? 0 : Math.sin(performance.now() / 35) * Math.min(1, Math.abs(車.v) / 60) * 0.5;
+  車mesh.position.set(車.x, 揺, 車.z);
+  車mesh.rotation.set(車.pitch, -車.a, 車.roll);
+
+  if (msgTimer > 0 && (msgTimer -= dt) <= 0) document.getElementById('msg').style.opacity = 0;
+}
+
+// カメラ（車の後ろを滑らかに追う）
+const 目標 = new THREE.Vector3(), 注視 = new THREE.Vector3(), 注視今 = new THREE.Vector3();
+let 初回 = true;
+function カメラ(dt) {
+  const fx = Math.sin(車.a), fz = -Math.cos(車.a);
+  const 距離 = 52 + Math.abs(車.v) * 0.08;
+  目標.set(車.x - fx * 距離, 24 + Math.abs(車.v) * 0.03, 車.z - fz * 距離);
+  注視.set(車.x + fx * 25, 6, 車.z + fz * 25);
+  if (初回) { camera.position.copy(目標); 注視今.copy(注視); 初回 = false; }
+  const k = 1 - Math.exp(-dt * 5);
+  camera.position.lerp(目標, k); 注視今.lerp(注視, k);
+  camera.lookAt(注視今);
+  camera.fov = 60 + Math.abs(車.v) / 最高速 * 10; camera.updateProjectionMatrix();
+  sun.position.set(車.x + 80, 160, 車.z + 50); sun.target.position.set(車.x, 0, 車.z);
+}
+
+function HUD() {
+  const s = 状態;
+  document.getElementById('hud').innerHTML =
+    `<b>${時間表示(s.mode === 'run' ? s.lapT : 0)}</b><br>` +
+    `LAP ${s.lap}　CP ${s.nextCP === 0 ? 4 : s.nextCP}/4<br>` +
+    `前回 ${時間表示(s.last)}<br>ベスト ${時間表示(s.best)}<br>` +
+    `コーン ${s.hits}`;
+  document.getElementById('speed').textContent = `${Math.round(Math.abs(車.v) * 0.6)} km/h`;
+  document.getElementById('center').textContent = s.mode === 'count' ? Math.ceil(s.countT) : '';
+  const [cx, cz] = CP[s.nextCP];
+  柱.position.set(cx, 45, cz);
+  柱.material.opacity = 0.14 + Math.sin(performance.now() / 250) * 0.05;
+}
+
+window.__debug = { 車, 状態, 入力, コーン }; // 動作確認用
+
+let 前回 = performance.now();
+renderer.setAnimationLoop(t => {
+  const dt = Math.min(0.05, (t - 前回) / 1000); 前回 = t;
+  更新(dt); カメラ(dt); HUD();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
